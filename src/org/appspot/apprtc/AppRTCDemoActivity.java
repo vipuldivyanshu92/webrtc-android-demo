@@ -34,8 +34,8 @@ import android.content.Intent;
 import android.graphics.Point;
 import android.media.AudioManager;
 import android.os.Bundle;
-import android.os.PowerManager;
 import android.util.Log;
+import android.view.WindowManager;
 import android.webkit.JavascriptInterface;
 import android.widget.EditText;
 import android.widget.Toast;
@@ -87,33 +87,16 @@ public class AppRTCDemoActivity extends Activity
   // Synchronize on quit[0] to avoid teardown-related crashes.
   private final Boolean[] quit = new Boolean[] { false };
   private MediaConstraints sdpMediaConstraints;
-  private PowerManager.WakeLock wakeLock;
 
   @Override
   public void onCreate(Bundle savedInstanceState) {
     super.onCreate(savedInstanceState);
 
-    // Since the error-handling of this demo consists of throwing
-    // RuntimeExceptions and we assume that'll terminate the app, we install
-    // this default handler so it's applied to background threads as well.
     Thread.setDefaultUncaughtExceptionHandler(
-        new Thread.UncaughtExceptionHandler() {
-          public void uncaughtException(Thread t, Throwable e) {
-            e.printStackTrace();
-            System.exit(-1);
-          }
-        });
+        new UnhandledExceptionHandler(this));
 
-    // Uncomment to get ALL WebRTC tracing and SENSITIVE libjingle logging.
-    // Logging.enableTracing(
-    //     "/sdcard/trace.txt",
-    //     EnumSet.of(Logging.TraceLevel.TRACE_ALL),
-    //     Logging.Severity.LS_SENSITIVE);
-
-    PowerManager powerManager = (PowerManager) getSystemService(POWER_SERVICE);
-    wakeLock = powerManager.newWakeLock(
-        PowerManager.SCREEN_BRIGHT_WAKE_LOCK, "AppRTCDemo");
-    wakeLock.acquire();
+    getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+    getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
 
     Point displaySize = new Point();
     getWindowManager().getDefaultDisplay().getSize(displaySize);
@@ -125,9 +108,13 @@ public class AppRTCDemoActivity extends Activity
 
     AudioManager audioManager =
         ((AudioManager) getSystemService(AUDIO_SERVICE));
-    audioManager.setMode(audioManager.isWiredHeadsetOn() ?
+    // TODO(fischman): figure out how to do this Right(tm) and remove the
+    // suppression.
+    @SuppressWarnings("deprecation")
+    boolean isWiredHeadsetOn = audioManager.isWiredHeadsetOn();
+    audioManager.setMode(isWiredHeadsetOn ?
         AudioManager.MODE_IN_CALL : AudioManager.MODE_IN_COMMUNICATION);
-    audioManager.setSpeakerphoneOn(!audioManager.isWiredHeadsetOn());
+    audioManager.setSpeakerphoneOn(!isWiredHeadsetOn);
 
     sdpMediaConstraints = new MediaConstraints();
     sdpMediaConstraints.mandatory.add(new MediaConstraints.KeyValuePair(
@@ -170,19 +157,18 @@ public class AppRTCDemoActivity extends Activity
   public void onPause() {
     super.onPause();
     vsv.onPause();
-    // TODO(fischman): IWBN to support pause/resume, but the WebRTC codebase
-    // isn't ready for that yet; e.g.
-    // https://code.google.com/p/webrtc/issues/detail?id=1407
-    // Instead, simply exit instead of pausing (the alternative leads to
-    // system-borking with wedged cameras; e.g. b/8224551)
-    disconnectAndExit();
+    if (videoSource != null) {
+      videoSource.stop();
+    }
   }
 
   @Override
   public void onResume() {
-    // The onResume() is a lie!  See TODO(fischman) in onPause() above.
     super.onResume();
     vsv.onResume();
+    if (videoSource != null) {
+      videoSource.restart();
+    }
   }
 
   @Override
@@ -190,6 +176,13 @@ public class AppRTCDemoActivity extends Activity
     factory = new PeerConnectionFactory();
     pc = factory.createPeerConnection(
         iceServers, appRtcClient.pcConstraints(), pcObserver);
+
+    // Uncomment to get ALL WebRTC tracing and SENSITIVE libjingle logging.
+    // NOTE: this _must_ happen while |factory| is alive!
+    // Logging.enableTracing(
+    //     "logcat:",
+    //     EnumSet.of(Logging.TraceLevel.TRACE_ALL),
+    //     Logging.Severity.LS_SENSITIVE);
 
     {
       final PeerConnection finalPC = pc;
@@ -219,14 +212,17 @@ public class AppRTCDemoActivity extends Activity
 
     {
       logAndToast("Creating local video source...");
-      VideoCapturer capturer = getVideoCapturer();
-      videoSource = factory.createVideoSource(
-          capturer, appRtcClient.videoConstraints());
       MediaStream lMS = factory.createLocalMediaStream("ARDAMS");
-      VideoTrack videoTrack = factory.createVideoTrack("ARDAMSv0", videoSource);
-      videoTrack.addRenderer(new VideoRenderer(new VideoCallbacks(
-          vsv, VideoStreamsView.Endpoint.LOCAL)));
-      lMS.addTrack(videoTrack);
+      if (appRtcClient.videoConstraints() != null) {
+        VideoCapturer capturer = getVideoCapturer();
+        videoSource = factory.createVideoSource(
+            capturer, appRtcClient.videoConstraints());
+        VideoTrack videoTrack =
+            factory.createVideoTrack("ARDAMSv0", videoSource);
+        videoTrack.addRenderer(new VideoRenderer(new VideoCallbacks(
+            vsv, VideoStreamsView.Endpoint.LOCAL)));
+        lMS.addTrack(videoTrack);
+      }
       lMS.addTrack(factory.createAudioTrack("ARDAMSa0"));
       pc.addStream(lMS, new MediaConstraints());
     }
@@ -256,7 +252,8 @@ public class AppRTCDemoActivity extends Activity
   }
 
   @Override
-  public void onDestroy() {
+  protected void onDestroy() {
+    disconnectAndExit();
     super.onDestroy();
   }
 
@@ -531,7 +528,6 @@ public class AppRTCDemoActivity extends Activity
         return;
       }
       quit[0] = true;
-      wakeLock.release();
       if (pc != null) {
         pc.dispose();
         pc = null;
